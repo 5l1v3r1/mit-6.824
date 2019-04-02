@@ -34,26 +34,47 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 	var wait sync.WaitGroup
-	for index := 0; index < ntasks; index++ {
-		select {
-		case worker := <-registerChan:
-			wait.Add(1)
-			go func(worker string, index int) {
-				args := &DoTaskArgs{
-					JobName:       jobName,
-					Phase:         phase,
-					TaskNumber:    index,
-					NumOtherPhase: n_other,
+	taskChan := make(chan *DoTaskArgs, 20)
+	for index := 0; index < ntasks; index++ { //初始化任务
+		args := &DoTaskArgs{
+			JobName:       jobName,
+			Phase:         phase,
+			TaskNumber:    index,
+			NumOtherPhase: n_other,
+		}
+		if phase == mapPhase {
+			args.File = mapFiles[index]
+		}
+		taskChan <- args
+	}
+	done := false
+	var completeTask int
+	for !done {
+		for worker := range registerChan {
+			select {
+			case args := <-taskChan:
+				wait.Add(1)
+				go func(worker string) {
+					result := call(worker, "Worker.DoTask", args, nil)
+					wait.Done()
+					if result == false {
+						taskChan <- args
+					} else {
+						completeTask++
+						registerChan <- worker
+					}
+				}(worker)
+			default:
+				if completeTask >= ntasks {
+					done = true
 				}
-				if phase == mapPhase {
-					args.File = mapFiles[index]
-				}
-				call(worker, "Worker.DoTask", args, nil)
-				wait.Done()
-				registerChan <- worker
-			}(worker, index)
+			}
+			if done == true {
+				break
+			}
 		}
 	}
+
 	wait.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
 }
