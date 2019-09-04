@@ -8,12 +8,16 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"code.byted.org/gopkg/logs"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -57,14 +61,15 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	fmt.Print("leader disconnects\n")
 	cfg.disconnect(leader1)
+	logs.Info("begin a leader\n")
 	cfg.checkOneLeader()
-	fmt.Println("disconnect")
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
+	fmt.Printf("old leader rejoins %v \n", leader1)
 	cfg.connect(leader1)
-	fmt.Println("old leader")
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no leader should
@@ -934,4 +939,16 @@ func TestReliableChurn2C(t *testing.T) {
 
 func TestUnreliableChurn2C(t *testing.T) {
 	internalChurn(t, true)
+}
+
+func TestTimerTicker(t *testing.T) {
+	fmt.Println("hello")
+	for {
+		ticker := time.NewTimer(time.Millisecond * time.Duration(100+rand.Intn(50)))
+		select {
+		case <-ticker.C:
+			fmt.Println("test")
+		}
+	}
+	time.Sleep(10 * time.Second)
 }

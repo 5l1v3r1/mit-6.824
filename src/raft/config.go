@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 
+	"code.byted.org/gopkg/logs"
+
 	crand "crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -327,6 +329,7 @@ func (cfg *config) checkOneLeader() int {
 			return leaders[lastTermWithLeader][0]
 		}
 	}
+	logs.Info("check end leader\n")
 	cfg.t.Fatalf("expected one leader, got none")
 	return -1
 }

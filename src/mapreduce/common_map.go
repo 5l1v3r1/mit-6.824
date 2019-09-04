@@ -1,4 +1,4 @@
-package mapreduce
+eackage mapreduce
 
 import (
 	"encoding/json"

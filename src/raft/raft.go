@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"6.824/src/labrpc"
+	"code.byted.org/gopkg/logs"
 )
 
 // import "bytes"
@@ -88,7 +89,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	if rf.status == 1 {
+	if rf.status == Leader {
 		isleader = true
 	}
 	term = rf.currentTerm
@@ -140,7 +141,7 @@ func (rf *Raft) readPersist(data []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
-	CandidateId  int //发起选举的人自身的id
+	CandidateID  int //发起选举的人自身的id
 	LastLogIndex int //假定Index从1开始
 	LastLogTerm  int
 }
@@ -157,7 +158,7 @@ type RequestVoteReply struct {
 
 type AppendEntriesArgs struct {
 	Term         int
-	LeaderId     int
+	LeaderID     int
 	PrevLogIndex int //entries前面的一条日志的Index, entries中的Index为PreLogIndex+i
 	PrevLogTerm  int
 	Entries      []LogEntry
@@ -171,40 +172,51 @@ type AppendEntriesReply struct {
 //
 // example RequestVote RPC handler.
 //
+//通过函数名直接指向函数
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		fmt.Printf("reason %v %v\n", args.Term, rf.currentTerm)
 		return
 	}
 	reply.Term = rf.currentTerm
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	rf.currentTerm = args.Term //TODO，还要变成follower
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		if args.LastLogIndex >= len(rf.logs) {
+			fmt.Printf(" term %v: %v vote for %v \n", args.Term, rf.me, args.CandidateID)
+			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
 		} else {
+			fmt.Printf("reason:%v\n", rf.votedFor)
 			reply.VoteGranted = false
 		}
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // AppendEntries RPC handler
+// TODO这里可能有问题
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	defer func() {
 		rf.hearbeatNotify <- true
 	}()
 	reply.Term = rf.currentTerm
+	if rf.status == Leader {
+		if args.Term > rf.currentTerm {
+			fmt.Printf("old leader become follower")
+			logs.Debug("%v from %v, currentTerm %v", args.Term, args.LeaderID, rf.currentTerm)
+			rf.currentTerm = args.Term
+			rf.status = Follower
+			reply.Success = false
+			return
+		}
+	}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
+	rf.currentTerm = reply.Term
 	if len(rf.logs) < args.PrevLogIndex || (len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		reply.Success = false
 		return
@@ -259,33 +271,41 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 //idle和正常的都应该在这里，先写了空闲的
-func (rf *Raft) sendAppendEntries() {
+func (rf *Raft) sendAppendEntries() bool {
 	args := &AppendEntriesArgs{
 		Term:     rf.currentTerm,
-		LeaderId: rf.me,
+		LeaderID: rf.me,
 	}
 
-	var wg sync.WaitGroup
-	for i, _ := range rf.peers {
+	isLeader := true
+	for i := range rf.peers {
 		reply := &AppendEntriesReply{}
 		if i == rf.me {
 			continue
 		}
-		wg.Add(1)
 		go func(i int) {
-			rf.peers[i].Call("Raft.AppendEntries", args, reply)
-			wg.Done()
+			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+			if ok {
+				//收到来自更大的term
+				if reply.Term > rf.currentTerm {
+					logs.Debug("old leader becom follower")
+					logs.Debug("%v from %v, currentTerm %v", reply.Term, i, rf.currentTerm)
+					rf.status = Follower //变成follower
+					rf.currentTerm = reply.Term
+					isLeader = false
+				}
+			}
 		}(i)
 	}
-	wg.Wait()
-
+	time.Sleep(10 * time.Millisecond) //先用这个替代处理消息的逻辑问题
+	return isLeader
 }
 
 func (rf *Raft) handleTimeout(me int) {
-	rf.currentTerm++
+	rf.currentTerm++ //当前term+1
 	args := &RequestVoteArgs{
 		Term:        rf.currentTerm,
-		CandidateId: me,
+		CandidateID: me,
 	}
 	if len(rf.logs) >= 1 {
 		args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
@@ -294,33 +314,40 @@ func (rf *Raft) handleTimeout(me int) {
 	//给自己投票
 	rf.votedFor = me
 	count := 1
-	var wg sync.WaitGroup
-	for i, _ := range rf.peers {
-		reply := &RequestVoteReply{}
+	for i := range rf.peers {
 		if i == me {
 			continue
 		}
-		wg.Add(1)
+		reply := &RequestVoteReply{}
+		//超时处理正确返回
 		go func(i int) {
-			wg.Done()
+			//发送给一个disconnect的会存在超时的现象
+			//disconnect 发的消息会延迟一段时间才能返回
 			ok := rf.sendRequestVote(i, args, reply)
-			if ok && reply.VoteGranted == true {
-				count++
+			if ok {
+				if reply.VoteGranted == true {
+					count++
+				} else if reply.VoteGranted == false {
+					if rf.currentTerm < reply.Term {
+						// rf.currentTerm = reply.Term
+					}
+				}
 			}
 		}(i)
 	}
-	wg.Wait()
-	fmt.Println(count)
+	time.Sleep(50 * time.Millisecond) //先用睡眠50ms的方法来做
 	if count > len(rf.peers)/2 {
 		rf.becomeLeader()
 	} else {
+		fmt.Printf("%v not requestVote success\n", me)
 		rf.votedFor = -1
+		rf.status = Follower //变成follower
 	}
 }
 
 func (rf *Raft) becomeLeader() {
 	// pretty.Print(rf)
-	rf.status = 1
+	rf.status = Leader
 }
 
 //
@@ -357,9 +384,11 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+//raft逻辑入口从这里开始
 func (rf *Raft) server() {
 	for {
-		switch rf.status {
+		status := rf.status
+		switch status {
 		case Follower:
 			rf.serverFollow()
 		case Leader:
@@ -372,29 +401,49 @@ func (rf *Raft) serverLeader() {
 	//发送一个空的idle
 	rf.sendAppendEntries()
 	for {
-		ticker := time.NewTimer(time.Millisecond * time.Duration(50+rand.Intn(100)))
+		ticker := time.NewTimer(time.Millisecond * time.Duration(100+rand.Intn(50)))
 		select {
 		case <-ticker.C:
-			rf.sendAppendEntries()
+			logs.Info("%v send heartbeat", rf.me)
+			isLeader := rf.sendAppendEntries()
+			if !isLeader {
+				fmt.Printf("is not have been a leader")
+				return
+			}
 		}
 	}
 }
 
-var ElectionTimeout time.Duration = time.Millisecond * time.Duration(200+rand.Intn(200))
-
 func (rf *Raft) serverFollow() {
 	for {
-		ticker := time.NewTimer(ElectionTimeout)
+		s := GenTimeoutDuration(200, 200)
+		logs.Info("%v time Durationn:%v\n", rf.me, s)
+		ticker := time.NewTimer(s)
 		select {
 		case <-ticker.C: //超时了
-			// pretty.Print(rf)
+			logs.Info("%v timeout begin leader election", rf.me)
 			rf.handleTimeout(rf.me)  //Fixme:这个函数应该在candidate中处理
 			if rf.status == Leader { //自身成为Leader了
+				fmt.Printf("%v becomLeader term:%v \n", rf.me, rf.currentTerm)
 				return
 			}
 		case <-rf.hearbeatNotify: //收到来自leader的消息
-			ticker.Reset(ElectionTimeout)
+			fmt.Printf("%v recv heartbeat from leader\n", rf.me)
+			ticker.Reset(GenTimeoutDuration(200, 200))
 		}
+	}
+}
+
+func (rf *Raft) serverCandidate() {
+	for {
+		s := GenTimeoutDuration(200, 200)
+		ticker := time.NewTimer(s)
+		select {
+		case <-ticker.C:
+			//超时重新发起投票
+			rf.handleTimeout(rf.me)
+		}
+
 	}
 }
 
