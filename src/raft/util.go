@@ -26,3 +26,13 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func poll(voteMap map[int]bool, totalNum int) bool {
+	voteNum := 0
+	for _, v := range voteMap {
+		if v == true {
+			voteNum++
+		}
+	}
+	return voteNum >= (totalNum/2 + 1)
+}

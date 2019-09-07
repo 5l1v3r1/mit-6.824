@@ -15,8 +15,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"code.byted.org/gopkg/logs"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -63,7 +61,6 @@ func TestReElection2A(t *testing.T) {
 	// if the leader disconnects, a new one should be elected.
 	fmt.Print("leader disconnects\n")
 	cfg.disconnect(leader1)
-	logs.Info("begin a leader\n")
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't

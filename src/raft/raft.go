@@ -74,6 +74,9 @@ type Raft struct {
 	logs           []LogEntry
 	leader         int
 	hearbeatNotify chan bool
+	applyCh        chan interface{}
+	msgCh          chan interface{} //peer的消息通道
+	voteMap        map[int]bool
 	status         int
 }
 
@@ -152,6 +155,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	ReplyID     int //回复者自身的ID
 	Term        int
 	VoteGranted bool //true,代表同意投票
 }
@@ -169,12 +173,36 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+type RequestVoteTuple struct {
+	args   *RequestVoteArgs
+	reply  *RequestVoteReply
+	syncCh chan bool
+}
+
+//通过函数名直接指向函数
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	tuple := &RequestVoteTuple{
+		args:   args,
+		reply:  reply,
+		syncCh: make(chan bool),
+	}
+	rf.msgCh <- tuple
+	//同步处理逻辑
+	<-tuple.syncCh
+}
+
 //
 // example RequestVote RPC handler.
 //
 //通过函数名直接指向函数
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	//这一段代码不应该放在这里
+	if args.Term > rf.currentTerm { //收到任何消息都会这样处理
+		rf.status = Follower
+		rf.votedFor = -1
+	}
+	reply.ReplyID = rf.me
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -286,62 +314,37 @@ func (rf *Raft) sendAppendEntries() bool {
 		go func(i int) {
 			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
 			if ok {
-				//收到来自更大的term
-				if reply.Term > rf.currentTerm {
-					logs.Debug("old leader becom follower")
-					logs.Debug("%v from %v, currentTerm %v", reply.Term, i, rf.currentTerm)
-					rf.status = Follower //变成follower
-					rf.currentTerm = reply.Term
-					isLeader = false
-				}
+				rf.msgCh <- reply
 			}
 		}(i)
 	}
-	time.Sleep(10 * time.Millisecond) //先用这个替代处理消息的逻辑问题
 	return isLeader
 }
 
-func (rf *Raft) handleTimeout(me int) {
+func (rf *Raft) handleTimeout() {
+	rf.voteMap = make(map[int]bool)
 	rf.currentTerm++ //当前term+1
 	args := &RequestVoteArgs{
 		Term:        rf.currentTerm,
-		CandidateID: me,
+		CandidateID: rf.me,
 	}
 	if len(rf.logs) >= 1 {
 		args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
-		args.LastLogIndex = len(rf.logs) + 1
+		args.LastLogIndex = len(rf.logs) //这里以前为什么要+1，先改成不加1
 	}
 	//给自己投票
-	rf.votedFor = me
-	count := 1
+	rf.votedFor = rf.me
 	for i := range rf.peers {
-		if i == me {
+		if i == rf.me {
 			continue
 		}
 		reply := &RequestVoteReply{}
-		//超时处理正确返回
 		go func(i int) {
-			//发送给一个disconnect的会存在超时的现象
-			//disconnect 发的消息会延迟一段时间才能返回
 			ok := rf.sendRequestVote(i, args, reply)
 			if ok {
-				if reply.VoteGranted == true {
-					count++
-				} else if reply.VoteGranted == false {
-					if rf.currentTerm < reply.Term {
-						// rf.currentTerm = reply.Term
-					}
-				}
+				rf.msgCh <- reply
 			}
 		}(i)
-	}
-	time.Sleep(50 * time.Millisecond) //先用睡眠50ms的方法来做
-	if count > len(rf.peers)/2 {
-		rf.becomeLeader()
-	} else {
-		fmt.Printf("%v not requestVote success\n", me)
-		rf.votedFor = -1
-		rf.status = Follower //变成follower
 	}
 }
 
@@ -370,6 +373,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	if rf.status != Leader {
+		return 0, 0, false
+	}
+
+	index = len(rf.logs) + 1
+	term = rf.currentTerm
+	go func() {
+		rf.applyCh <- command
+	}()
 
 	return index, term, isLeader
 }
@@ -393,6 +405,8 @@ func (rf *Raft) server() {
 			rf.serverFollow()
 		case Leader:
 			rf.serverLeader()
+		case Candidate:
+			rf.serverCandidate()
 		}
 	}
 }
@@ -410,23 +424,33 @@ func (rf *Raft) serverLeader() {
 				fmt.Printf("is not have been a leader")
 				return
 			}
+		case <-rf.applyCh:
+			//向follower发送消息
+			logs.Info("%v ready to sync message", rf.me)
+		case val := <-rf.msgCh:
+			//收到来自peer的消息
+			switch peerMsg := val.(type) {
+			case *AppendEntriesReply: //发送消息的回报，心跳也在这里处理
+				if peerMsg.Term > rf.currentTerm {
+					logs.Info("%v leader become follower bigTerm:%v", rf.me, peerMsg.Term)
+					rf.currentTerm = peerMsg.Term
+					rf.status = Follower
+					return
+				}
+				logs.Info("%v reciveAppendEntriesReply Term %v", rf.me, peerMsg.Term)
+			}
 		}
 	}
 }
 
 func (rf *Raft) serverFollow() {
+	ticker := time.NewTimer(GenTimeoutDuration(200, 200))
 	for {
-		s := GenTimeoutDuration(200, 200)
-		logs.Info("%v time Durationn:%v\n", rf.me, s)
-		ticker := time.NewTimer(s)
 		select {
 		case <-ticker.C: //超时了
-			logs.Info("%v timeout begin leader election", rf.me)
-			rf.handleTimeout(rf.me)  //Fixme:这个函数应该在candidate中处理
-			if rf.status == Leader { //自身成为Leader了
-				fmt.Printf("%v becomLeader term:%v \n", rf.me, rf.currentTerm)
-				return
-			}
+			logs.Info("timeout")
+			rf.status = Candidate
+			return
 		case <-rf.hearbeatNotify: //收到来自leader的消息
 			fmt.Printf("%v recv heartbeat from leader\n", rf.me)
 			ticker.Reset(GenTimeoutDuration(200, 200))
@@ -435,13 +459,42 @@ func (rf *Raft) serverFollow() {
 }
 
 func (rf *Raft) serverCandidate() {
+	ticker := time.NewTimer(GenTimeoutDuration(200, 200))
+	rf.handleTimeout()
 	for {
-		s := GenTimeoutDuration(200, 200)
-		ticker := time.NewTimer(s)
 		select {
 		case <-ticker.C:
 			//超时重新发起投票
-			rf.handleTimeout(rf.me)
+			rf.handleTimeout()
+			ticker.Reset(GenTimeoutDuration(200, 200))
+		case val := <-rf.msgCh:
+			//收到来自peer的消息
+			switch peerMsg := val.(type) {
+			case *RequestVoteReply:
+				logs.Info("%v %v recv peer message %v ", rf.me, rf.currentTerm, *peerMsg)
+				if peerMsg.Term > rf.currentTerm {
+					rf.currentTerm = peerMsg.Term
+					rf.votedFor = -1
+					rf.status = Follower
+					return
+				}
+				rf.voteMap[peerMsg.ReplyID] = peerMsg.VoteGranted
+				if poll(rf.voteMap, len(rf.nextIndex)) {
+					rf.status = Leader
+					return
+				}
+			case *RequestVoteTuple:
+				if peerMsg.args.Term > rf.currentTerm {
+					rf.currentTerm = peerMsg.args.Term
+					rf.votedFor = -1
+					rf.status = Follower
+				}
+				rf.requestVote(peerMsg.args, peerMsg.reply)
+				close(peerMsg.syncCh)
+				if rf.status != Candidate {
+					return
+				}
+			}
 		}
 
 	}
@@ -471,6 +524,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make(map[int]int, len(peers))
 	rf.hearbeatNotify = make(chan bool)
 	rf.status = Follower
+	rf.applyCh = make(chan interface{}, 5)
+	rf.msgCh = make(chan interface{}, 5)
+	rf.voteMap = make(map[int]bool)
 
 	//非leader的处理逻辑
 	//如何接收消息
