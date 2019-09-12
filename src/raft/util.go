@@ -3,6 +3,7 @@ package raft
 import (
 	"log"
 	"math/rand"
+	"sort"
 	"time"
 )
 
@@ -20,11 +21,14 @@ func GenTimeoutDuration(base int, scope int) time.Duration {
 	return time.Millisecond * time.Duration(base+rand.Intn(scope))
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func min(a int, b ...int) int {
+	minVal := a
+	for _, v := range b {
+		if v < minVal {
+			minVal = v
+		}
 	}
-	return b
+	return minVal
 }
 
 func poll(voteMap map[int]bool, totalNum int) bool {
@@ -35,4 +39,19 @@ func poll(voteMap map[int]bool, totalNum int) bool {
 		}
 	}
 	return voteNum >= (totalNum/2 + 1)
+}
+
+//一半数以上的最小值
+func pollCommitIndex(matchIndexMap map[int]int) int {
+	indexSlice := make([]int, 0)
+	for _, v := range matchIndexMap {
+		indexSlice = append(indexSlice, v)
+	}
+	sort.Ints(indexSlice)
+
+	if len(matchIndexMap)%2 == 0 {
+		return indexSlice[len(indexSlice)/2-1]
+	}
+	return indexSlice[len(indexSlice)/2]
+
 }

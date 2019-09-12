@@ -74,7 +74,7 @@ type Raft struct {
 	logs           []LogEntry
 	leader         int
 	hearbeatNotify chan bool
-	applyCh        chan interface{}
+	applyCh        chan ApplyMsg
 	msgCh          chan interface{} //peer的消息通道
 	voteMap        map[int]bool
 	status         int
@@ -161,16 +161,20 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int //entries前面的一条日志的Index, entries中的Index为PreLogIndex+i
-	PrevLogTerm  int
-	Entries      []LogEntry
+	Term              int
+	LeaderID          int
+	PrevLogIndex      int //entries前面的一条日志的Index, index从1开始
+	PrevLogTerm       int
+	Entries           []LogEntry
+	LeaderCommitIndex int //LeaderCommitIndex
 }
 
 type AppendEntriesReply struct {
-	Term    int //currentTerm
-	Success bool
+	Term       int //currentTerm
+	Success    bool
+	MatchIndex int
+	Id         int //自身的ID
+
 }
 
 type RequestVoteTuple struct {
@@ -224,7 +228,6 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 // AppendEntries RPC handler
-// TODO这里可能有问题
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	defer func() {
 		rf.hearbeatNotify <- true
@@ -232,8 +235,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	if rf.status == Leader {
 		if args.Term > rf.currentTerm {
-			fmt.Printf("old leader become follower")
-			logs.Debug("%v from %v, currentTerm %v", args.Term, args.LeaderID, rf.currentTerm)
+			logs.Debug("%v from %v, leader becom followercurrentTerm %v", args.Term, args.LeaderID, rf.currentTerm)
 			rf.currentTerm = args.Term
 			rf.status = Follower
 			reply.Success = false
@@ -245,11 +247,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	rf.currentTerm = reply.Term
-	if len(rf.logs) < args.PrevLogIndex || (len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		reply.Success = false
 		return
 	}
-	index := args.PrevLogIndex //因为index从1开始的，所以在数组里就代表下一个元素的位置
+	index := args.PrevLogIndex //因为是从1快开始的，下一个元素的位置
 	appendIndex := 0
 
 	for ; index < len(rf.logs) && appendIndex < len(args.Entries); index++ {
@@ -260,7 +262,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.logs = rf.logs[:index] //截断
 	rf.logs = append(rf.logs, args.Entries[appendIndex:]...)
-	rf.commitIndex = min(rf.commitIndex, len(rf.logs))
+	curCommitIndex := min(args.LeaderCommitIndex, len(rf.logs))
+	go func() {
+		for i := rf.commitIndex + 1; i <= curCommitIndex; i++ {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i-1].Command,
+				CommandIndex: i,
+			}
+			rf.applyCh <- msg
+		}
+	}()
 	reply.Success = true
 }
 
@@ -300,10 +312,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 //idle和正常的都应该在这里，先写了空闲的
 func (rf *Raft) sendAppendEntries() bool {
-	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderID: rf.me,
-	}
 
 	isLeader := true
 	for i := range rf.peers {
@@ -312,8 +320,30 @@ func (rf *Raft) sendAppendEntries() bool {
 			continue
 		}
 		go func(i int) {
+			args := &AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderID: rf.me,
+			}
+
+			//感觉这里写的不够优雅
+			args.PrevLogIndex = rf.nextIndex[i] - 1
+			if len(rf.logs) > 0 {
+				if args.PrevLogIndex > 0 {
+					args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+				}
+				if args.PrevLogIndex < len(rf.logs) {
+					args.Entries = append(args.Entries, rf.logs[args.PrevLogIndex])
+				}
+				args.LeaderCommitIndex = rf.commitIndex
+			}
 			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+			//在这里加上
+			//这里是否有必要在reply中加上matchIndex?
 			if ok {
+				if len(args.Entries) > 0 {
+					reply.MatchIndex = args.PrevLogIndex + 1
+				}
+				reply.Id = i
 				rf.msgCh <- reply
 			}
 		}(i)
@@ -379,9 +409,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index = len(rf.logs) + 1
 	term = rf.currentTerm
-	go func() {
-		rf.applyCh <- command
-	}()
+	//插入到日志中去，向follower发送消息
+	rf.logs = append(rf.logs, LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+	})
+	rf.matchIndex[rf.me] = len(rf.logs)
 
 	return index, term, isLeader
 }
@@ -412,6 +445,7 @@ func (rf *Raft) server() {
 }
 
 func (rf *Raft) serverLeader() {
+	rf.initLeader()
 	//发送一个空的idle
 	rf.sendAppendEntries()
 	for {
@@ -421,12 +455,17 @@ func (rf *Raft) serverLeader() {
 			logs.Info("%v send heartbeat", rf.me)
 			isLeader := rf.sendAppendEntries()
 			if !isLeader {
+				rf.status = Follower
 				fmt.Printf("is not have been a leader")
 				return
 			}
-		case <-rf.applyCh:
-			//向follower发送消息
-			logs.Info("%v ready to sync message", rf.me)
+		// case val := <-rf.applyCh:
+		// 	//向follower发送消息
+		// 	rf.logs = append(rf.logs, LogEntry{
+		// 		Command: val,
+		// 		Term:    rf.currentTerm,
+		// 	})
+		// 	logs.Info("%v ready to sync message", rf.me)
 		case val := <-rf.msgCh:
 			//收到来自peer的消息
 			switch peerMsg := val.(type) {
@@ -437,7 +476,30 @@ func (rf *Raft) serverLeader() {
 					rf.status = Follower
 					return
 				}
-				logs.Info("%v reciveAppendEntriesReply Term %v", rf.me, peerMsg.Term)
+				if peerMsg.Success == false {
+					rf.nextIndex[peerMsg.Id]--
+				} else {
+					//返回的消息index大于上次发送的index
+					if peerMsg.MatchIndex > rf.matchIndex[peerMsg.Id] {
+						rf.nextIndex[peerMsg.Id] = peerMsg.MatchIndex + 1
+						rf.matchIndex[peerMsg.Id] = peerMsg.MatchIndex
+						//查询当前match
+					}
+					curCommitIndex := pollCommitIndex(rf.matchIndex)
+					go func(index int) {
+						for i := index + 1; i <= curCommitIndex; i++ {
+							msg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.logs[i-1].Command,
+								CommandIndex: i,
+							}
+							logs.Warn("Leader send apply %v", msg)
+							rf.applyCh <- msg
+						}
+					}(rf.commitIndex)
+					rf.commitIndex = curCommitIndex
+					logs.Info("commit Index%v %v %v ", rf.commitIndex, rf.matchIndex, rf.logs)
+				}
 			}
 		}
 	}
@@ -500,6 +562,15 @@ func (rf *Raft) serverCandidate() {
 	}
 }
 
+//成为leader时调用的函数
+//不应该同步不是该term内的数据？
+func (rf *Raft) initLeader() {
+	for k, _ := range rf.peers {
+		rf.nextIndex[k] = len(rf.logs) + 1
+		rf.matchIndex[k] = 0
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -524,7 +595,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make(map[int]int, len(peers))
 	rf.hearbeatNotify = make(chan bool)
 	rf.status = Follower
-	rf.applyCh = make(chan interface{}, 5)
+	rf.applyCh = applyCh
 	rf.msgCh = make(chan interface{}, 5)
 	rf.voteMap = make(map[int]bool)
 
