@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sort"
 	"time"
+
+	"code.byted.org/gopkg/logs"
 )
 
 // Debugging
@@ -38,6 +40,7 @@ func poll(voteMap map[int]bool, totalNum int) bool {
 			voteNum++
 		}
 	}
+	logs.Info("voteNum %v totalNum %v", voteNum, totalNum)
 	return voteNum >= (totalNum/2 + 1)
 }
 

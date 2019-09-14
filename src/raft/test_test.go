@@ -49,6 +49,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.end()
 }
 
+//这个测试貌似有时会通过？
 func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -947,5 +948,4 @@ func TestTimerTicker(t *testing.T) {
 			fmt.Println("test")
 		}
 	}
-	time.Sleep(10 * time.Second)
 }

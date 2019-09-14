@@ -78,6 +78,7 @@ type Raft struct {
 	msgCh          chan interface{} //peer的消息通道
 	voteMap        map[int]bool
 	status         int
+	statusCh       chan bool //身份的转变
 }
 
 type LogEntry struct {
@@ -205,6 +206,7 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm { //收到任何消息都会这样处理
 		rf.status = Follower
 		rf.votedFor = -1
+		rf.voteMap = make(map[int]bool)
 	}
 	reply.ReplyID = rf.me
 	if args.Term < rf.currentTerm {
@@ -216,12 +218,14 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	rf.currentTerm = args.Term //TODO，还要变成follower
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
-		if args.LastLogIndex >= len(rf.logs) {
+		//因为前面提前返回了Term小于的条件，所以这里第二个判断语句里，默认条件为相等
+		if rf.logUpTodate(args) {
 			fmt.Printf(" term %v: %v vote for %v \n", args.Term, rf.me, args.CandidateID)
 			rf.votedFor = args.CandidateID
+			rf.voteMap = make(map[int]bool)
 			reply.VoteGranted = true
 		} else {
-			fmt.Printf("reason:%v\n", rf.votedFor)
+			fmt.Printf("reason:my %v  request %v\n", len(rf.logs), args.LastLogIndex)
 			reply.VoteGranted = false
 		}
 	}
@@ -235,16 +239,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	if rf.status == Leader {
 		if args.Term > rf.currentTerm {
-			logs.Debug("%v from %v, leader becom followercurrentTerm %v", args.Term, args.LeaderID, rf.currentTerm)
+			logs.Debug("%v from %v, leader %v becom followercurrentTerm %v", args.Term, args.LeaderID, rf.me, rf.currentTerm)
 			rf.currentTerm = args.Term
 			rf.status = Follower
 			reply.Success = false
+			rf.statusCh <- true
 			return
 		}
 	}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
+	}
+	if rf.status == Candidate {
+		rf.status = Follower
+		rf.statusCh <- true
 	}
 	rf.currentTerm = reply.Term
 	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
@@ -364,6 +373,7 @@ func (rf *Raft) handleTimeout() {
 	}
 	//给自己投票
 	rf.votedFor = rf.me
+	rf.voteMap[rf.me] = true
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -451,6 +461,10 @@ func (rf *Raft) serverLeader() {
 	for {
 		ticker := time.NewTimer(time.Millisecond * time.Duration(100+rand.Intn(50)))
 		select {
+		case <-rf.statusCh:
+			if rf.status != Leader {
+				return
+			}
 		case <-ticker.C:
 			logs.Info("%v send heartbeat", rf.me)
 			isLeader := rf.sendAppendEntries()
@@ -498,7 +512,7 @@ func (rf *Raft) serverLeader() {
 						}
 					}(rf.commitIndex)
 					rf.commitIndex = curCommitIndex
-					logs.Info("commit Index%v %v %v ", rf.commitIndex, rf.matchIndex, rf.logs)
+					logs.Info("leader %v  term %vcommit Index%v %v %v %v ", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, rf.logs, rf.nextIndex)
 				}
 			}
 		}
@@ -510,7 +524,7 @@ func (rf *Raft) serverFollow() {
 	for {
 		select {
 		case <-ticker.C: //超时了
-			logs.Info("timeout")
+			logs.Info("%v timeout", rf.me)
 			rf.status = Candidate
 			return
 		case <-rf.hearbeatNotify: //收到来自leader的消息
@@ -525,6 +539,11 @@ func (rf *Raft) serverCandidate() {
 	rf.handleTimeout()
 	for {
 		select {
+		case <-rf.statusCh:
+			if rf.status != Candidate {
+				logs.Info(" %v status convert to %v ", rf.me, rf.status)
+				return
+			}
 		case <-ticker.C:
 			//超时重新发起投票
 			rf.handleTimeout()
@@ -537,11 +556,12 @@ func (rf *Raft) serverCandidate() {
 				if peerMsg.Term > rf.currentTerm {
 					rf.currentTerm = peerMsg.Term
 					rf.votedFor = -1
+					rf.voteMap = make(map[int]bool)
 					rf.status = Follower
 					return
 				}
 				rf.voteMap[peerMsg.ReplyID] = peerMsg.VoteGranted
-				if poll(rf.voteMap, len(rf.nextIndex)) {
+				if poll(rf.voteMap, len(rf.peers)) {
 					rf.status = Leader
 					return
 				}
@@ -562,13 +582,33 @@ func (rf *Raft) serverCandidate() {
 	}
 }
 
+//判断请求参数中的日志是否更新
+func (rf *Raft) logUpTodate(args *RequestVoteArgs) bool {
+	if len(rf.logs) == 0 {
+		return true
+	}
+	if args.LastLogTerm > rf.logs[len(rf.logs)-1].Term {
+		return true
+	}
+
+	//最后一条日志相同term相同的
+	if args.LastLogTerm == rf.logs[len(rf.logs)-1].Term {
+		if args.LastLogIndex >= len(rf.logs) {
+			return true
+		}
+	}
+	return false
+}
+
 //成为leader时调用的函数
 //不应该同步不是该term内的数据？
 func (rf *Raft) initLeader() {
+	logs.Info("%v become Leader", rf.me)
 	for k, _ := range rf.peers {
 		rf.nextIndex[k] = len(rf.logs) + 1
 		rf.matchIndex[k] = 0
 	}
+	rf.matchIndex[rf.me] = len(rf.logs)
 }
 
 //
