@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"code.byted.org/gopkg/logs"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -79,6 +81,7 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
+	logs.Info("connect %v", leader2+1)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
@@ -332,6 +335,9 @@ func TestRejoin2B(t *testing.T) {
 	cfg.end()
 }
 
+//这个地方测试偶尔会panic
+//panic猜测是由于并发的goroutine等到运行时取值才导致的
+//这个函数测试偶尔会不通过，猜测是提交了以前term的日志
 func TestBackup2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false)
@@ -340,7 +346,6 @@ func TestBackup2B(t *testing.T) {
 	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
 
 	cfg.one(rand.Int(), servers, true)
-
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)

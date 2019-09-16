@@ -69,14 +69,14 @@ type Raft struct {
 	votedFor       int
 	commitIndex    int
 	lastApplied    int
-	nextIndex      map[int]int
-	matchIndex     map[int]int
+	nextIndex      map[int]int //index从1开始，初始值为len(logs）+1
+	matchIndex     map[int]int //初始值为0
 	logs           []LogEntry
 	leader         int
 	hearbeatNotify chan bool
-	applyCh        chan ApplyMsg
+	applyCh        chan ApplyMsg    //业务
 	msgCh          chan interface{} //peer的消息通道
-	voteMap        map[int]bool
+	voteMap        map[int]bool     //当前term，peer节点的投票情况
 	status         int
 	statusCh       chan bool //身份的转变
 }
@@ -202,13 +202,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //通过函数名直接指向函数
 func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//这一段代码不应该放在这里
-	if args.Term > rf.currentTerm { //收到任何消息都会这样处理
-		rf.status = Follower
-		rf.votedFor = -1
-		rf.voteMap = make(map[int]bool)
-	}
 	reply.ReplyID = rf.me
+	//请求者的term小于我的term，直接返回fasle
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -216,17 +211,15 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	reply.Term = rf.currentTerm
-	rf.currentTerm = args.Term //TODO，还要变成follower
+	reply.VoteGranted = false
+	rf.currentTerm = args.Term
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
-		//因为前面提前返回了Term小于的条件，所以这里第二个判断语句里，默认条件为相等
-		if rf.logUpTodate(args) {
+		if rf.logUpTodate(args) { //请求者的日志符合条件的时候
 			fmt.Printf(" term %v: %v vote for %v \n", args.Term, rf.me, args.CandidateID)
 			rf.votedFor = args.CandidateID
 			rf.voteMap = make(map[int]bool)
 			reply.VoteGranted = true
-		} else {
-			fmt.Printf("reason:my %v  request %v\n", len(rf.logs), args.LastLogIndex)
-			reply.VoteGranted = false
+			//需不需要变成follower?
 		}
 	}
 }
@@ -236,17 +229,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer func() {
 		rf.hearbeatNotify <- true
 	}()
-	reply.Term = rf.currentTerm
-	if rf.status == Leader {
+	if rf.status != Follower { //身份转变成follower
 		if args.Term > rf.currentTerm {
-			logs.Debug("%v from %v, leader %v becom followercurrentTerm %v", args.Term, args.LeaderID, rf.me, rf.currentTerm)
-			rf.currentTerm = args.Term
-			rf.status = Follower
-			reply.Success = false
+			logs.Info(" %v term %v converto to follow", rf.me, args.Term)
+			rf.meetBigTerm(args.Term)
 			rf.statusCh <- true
-			return
 		}
 	}
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -255,33 +245,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.status = Follower
 		rf.statusCh <- true
 	}
-	rf.currentTerm = reply.Term
 	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		logs.Info("deny request reason %v len %v", args, len(rf.logs))
 		reply.Success = false
 		return
 	}
-	index := args.PrevLogIndex //因为是从1快开始的，下一个元素的位置
-	appendIndex := 0
+	if len(args.Entries) != 0 {
+		index := args.PrevLogIndex //因为是从1快开始的，下一个元素的位置
+		appendIndex := 0
 
-	for ; index < len(rf.logs) && appendIndex < len(args.Entries); index++ {
-		if rf.logs[index].Term != args.Entries[appendIndex].Term {
-			break
-		}
-		appendIndex++
-	}
-	rf.logs = rf.logs[:index] //截断
-	rf.logs = append(rf.logs, args.Entries[appendIndex:]...)
-	curCommitIndex := min(args.LeaderCommitIndex, len(rf.logs))
-	go func() {
-		for i := rf.commitIndex + 1; i <= curCommitIndex; i++ {
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[i-1].Command,
-				CommandIndex: i,
+		for ; index < len(rf.logs) && appendIndex < len(args.Entries); index++ {
+			if rf.logs[index].Term != args.Entries[appendIndex].Term {
+				break
 			}
-			rf.applyCh <- msg
+			appendIndex++
 		}
-	}()
+		rf.logs = rf.logs[:index] //截断
+		rf.logs = append(rf.logs, args.Entries[appendIndex:]...)
+	}
+	curCommitIndex := min(args.LeaderCommitIndex, len(rf.logs))
+	//这个判断条件防止 follower由于收到心跳 提前提交不在当前term内的日志
+	if len(rf.logs) > 0 && rf.logs[len(rf.logs)-1].Term == args.Term {
+		go func() {
+			for i := rf.commitIndex + 1; i <= curCommitIndex; i++ {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[i-1].Command,
+					CommandIndex: i,
+				}
+				logs.Info("follower apply %v", msg)
+				rf.applyCh <- msg
+			}
+			rf.commitIndex = curCommitIndex
+		}()
+	}
 	reply.Success = true
 }
 
@@ -319,38 +316,55 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-//idle和正常的都应该在这里，先写了空闲的
+//发送数据，心跳也在这里
 func (rf *Raft) sendAppendEntries() bool {
 
 	isLeader := true
 	for i := range rf.peers {
-		reply := &AppendEntriesReply{}
 		if i == rf.me {
 			continue
 		}
 		go func(i int) {
+			reply := &AppendEntriesReply{}
 			args := &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderID: rf.me,
+				Term:              rf.currentTerm,
+				LeaderID:          rf.me,
+				PrevLogIndex:      0,
+				PrevLogTerm:       0,
+				LeaderCommitIndex: rf.commitIndex,
 			}
 
-			//感觉这里写的不够优雅
-			args.PrevLogIndex = rf.nextIndex[i] - 1
-			if len(rf.logs) > 0 {
-				if args.PrevLogIndex > 0 {
+			//if last logindex >= nextIndex
+			//需要发送数据
+			//后面一个条件是用来保证leader只提交当前term的日志
+			if len(rf.logs) >= rf.nextIndex[i] && rf.logs[len(rf.logs)-1].Term == rf.currentTerm {
+				args.PrevLogIndex = rf.nextIndex[i] - 1
+				//后面那个条件是为了应对身份转变时，并发修改对象的logs和PrevLogIndex
+				if args.PrevLogIndex > 0 && args.PrevLogIndex-1 < len(rf.logs) {
 					args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
 				}
-				if args.PrevLogIndex < len(rf.logs) {
-					args.Entries = append(args.Entries, rf.logs[args.PrevLogIndex])
-				}
-				args.LeaderCommitIndex = rf.commitIndex
+				args.Entries = append(args.Entries, rf.logs[args.PrevLogIndex:]...)
 			}
+
+			// //感觉这里写的不够优雅
+			// args.PrevLogIndex = rf.nextIndex[i] - 1
+			// if len(rf.logs) > 0 {
+			// 	//后面那个条件是为了应对身份转变时，并发修改对象的logs和PrevLogIndex
+			// 	//猜测是go func运行时才取值的
+			// 	if args.PrevLogIndex > 0 && args.PrevLogIndex-1 < len(rf.logs) {
+			// 		args.PrevLogTerm = rf.logs[args.PrevLogIndex-1].Term
+			// 	}
+			// 	if args.PrevLogIndex < len(rf.logs) {
+			// 		args.Entries = append(args.Entries, rf.logs[args.PrevLogIndex])
+			// 	}
+			// 	args.LeaderCommitIndex = rf.commitIndex
+			// }
 			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
 			//在这里加上
 			//这里是否有必要在reply中加上matchIndex?
 			if ok {
 				if len(args.Entries) > 0 {
-					reply.MatchIndex = args.PrevLogIndex + 1
+					reply.MatchIndex = args.PrevLogIndex + len(args.Entries)
 				}
 				reply.Id = i
 				rf.msgCh <- reply
@@ -458,39 +472,36 @@ func (rf *Raft) serverLeader() {
 	rf.initLeader()
 	//发送一个空的idle
 	rf.sendAppendEntries()
+	ticker := time.NewTimer(time.Millisecond * time.Duration(50+rand.Intn(50)))
 	for {
-		ticker := time.NewTimer(time.Millisecond * time.Duration(100+rand.Intn(50)))
 		select {
 		case <-rf.statusCh:
 			if rf.status != Leader {
+				logs.Info("leader %v become follower", rf.me)
 				return
 			}
 		case <-ticker.C:
-			logs.Info("%v send heartbeat", rf.me)
-			isLeader := rf.sendAppendEntries()
-			if !isLeader {
-				rf.status = Follower
-				fmt.Printf("is not have been a leader")
-				return
-			}
-		// case val := <-rf.applyCh:
-		// 	//向follower发送消息
-		// 	rf.logs = append(rf.logs, LogEntry{
-		// 		Command: val,
-		// 		Term:    rf.currentTerm,
-		// 	})
-		// 	logs.Info("%v ready to sync message", rf.me)
+			logs.Info("%v send heartbeat term %v", rf.me, rf.currentTerm)
+			rf.sendAppendEntries()
+			ticker.Reset(GenTimeoutDuration(50, 50))
 		case val := <-rf.msgCh:
 			//收到来自peer的消息
 			switch peerMsg := val.(type) {
+			case *RequestVoteTuple:
+				if peerMsg.args.Term > rf.currentTerm {
+					rf.meetBigTerm(peerMsg.args.Term)
+					rf.statusCh <- true
+				}
+				rf.requestVote(peerMsg.args, peerMsg.reply)
+				close(peerMsg.syncCh)
 			case *AppendEntriesReply: //发送消息的回报，心跳也在这里处理
 				if peerMsg.Term > rf.currentTerm {
 					logs.Info("%v leader become follower bigTerm:%v", rf.me, peerMsg.Term)
-					rf.currentTerm = peerMsg.Term
-					rf.status = Follower
+					rf.meetBigTerm(peerMsg.Term)
 					return
 				}
 				if peerMsg.Success == false {
+					logs.Info("peerMsg deny %v", peerMsg)
 					rf.nextIndex[peerMsg.Id]--
 				} else {
 					//返回的消息index大于上次发送的index
@@ -512,8 +523,10 @@ func (rf *Raft) serverLeader() {
 						}
 					}(rf.commitIndex)
 					rf.commitIndex = curCommitIndex
-					logs.Info("leader %v  term %vcommit Index%v %v %v %v ", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, rf.logs, rf.nextIndex)
+					logs.Info("leader %v  term %vcommit Index%v %v  %v len=%v ", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, rf.nextIndex, len(rf.logs))
 				}
+			default:
+				logs.Info("unkownType %v", val)
 			}
 		}
 	}
@@ -528,8 +541,20 @@ func (rf *Raft) serverFollow() {
 			rf.status = Candidate
 			return
 		case <-rf.hearbeatNotify: //收到来自leader的消息
-			fmt.Printf("%v recv heartbeat from leader\n", rf.me)
+			logs.Info("%v recv heartbeat from leader\n", rf.me)
 			ticker.Reset(GenTimeoutDuration(200, 200))
+		case val := <-rf.msgCh:
+			//收到来自peer的消息
+			switch peerMsg := val.(type) {
+			case *RequestVoteTuple:
+				if peerMsg.args.Term > rf.currentTerm {
+					rf.meetBigTerm((peerMsg.args.Term))
+				}
+				rf.requestVote(peerMsg.args, peerMsg.reply)
+				close(peerMsg.syncCh)
+			default:
+				logs.Info("unkownType %v", val)
+			}
 		}
 	}
 }
@@ -546,6 +571,7 @@ func (rf *Raft) serverCandidate() {
 			}
 		case <-ticker.C:
 			//超时重新发起投票
+			logs.Info("%v timeout term %v", rf.me, rf.currentTerm)
 			rf.handleTimeout()
 			ticker.Reset(GenTimeoutDuration(200, 200))
 		case val := <-rf.msgCh:
@@ -567,15 +593,13 @@ func (rf *Raft) serverCandidate() {
 				}
 			case *RequestVoteTuple:
 				if peerMsg.args.Term > rf.currentTerm {
-					rf.currentTerm = peerMsg.args.Term
-					rf.votedFor = -1
-					rf.status = Follower
+					rf.meetBigTerm((peerMsg.args.Term))
+					rf.statusCh <- true
 				}
 				rf.requestVote(peerMsg.args, peerMsg.reply)
 				close(peerMsg.syncCh)
-				if rf.status != Candidate {
-					return
-				}
+			default:
+				logs.Info("unkownType %v", val)
 			}
 		}
 
@@ -611,6 +635,14 @@ func (rf *Raft) initLeader() {
 	rf.matchIndex[rf.me] = len(rf.logs)
 }
 
+//收到更大的term请求/回应的时候, 身份转变成follower
+func (rf *Raft) meetBigTerm(bigTerm int) {
+	rf.currentTerm = bigTerm
+	rf.votedFor = -1
+	rf.voteMap = make(map[int]bool)
+	rf.status = Follower
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -633,7 +665,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = make(map[int]int, len(peers))
 	rf.matchIndex = make(map[int]int, len(peers))
-	rf.hearbeatNotify = make(chan bool)
+	rf.hearbeatNotify = make(chan bool, 1)
+	rf.statusCh = make(chan bool, 1)
 	rf.status = Follower
 	rf.applyCh = applyCh
 	rf.msgCh = make(chan interface{}, 5)
