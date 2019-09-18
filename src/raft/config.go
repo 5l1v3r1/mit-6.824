@@ -15,8 +15,6 @@ import (
 	"sync"
 	"testing"
 
-	"code.byted.org/gopkg/logs"
-
 	crand "crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -329,7 +327,6 @@ func (cfg *config) checkOneLeader() int {
 			return leaders[lastTermWithLeader][0]
 		}
 	}
-	logs.Info("check end leader\n")
 	cfg.t.Fatalf("expected one leader, got none")
 	return -1
 }
@@ -470,7 +467,6 @@ func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
-				logs.Info("%v", cfg.logs)
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {

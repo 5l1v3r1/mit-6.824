@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"code.byted.org/gopkg/logs"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -81,7 +80,7 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
-	logs.Info("connect %v", leader2+1)
+	// logs.Info("connect %v", leader2+1)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.

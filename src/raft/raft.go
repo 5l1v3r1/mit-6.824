@@ -19,12 +19,12 @@ package raft
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
 
 	"6.824/src/labrpc"
-	"code.byted.org/gopkg/logs"
 )
 
 // import "bytes"
@@ -246,7 +246,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.statusCh <- true
 	}
 	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		logs.Info("deny request reason %v len %v", args, len(rf.logs))
+		log.Println("deny request reason %v len %v", args, len(rf.logs))
 		reply.Success = false
 		return
 	}
@@ -501,7 +501,7 @@ func (rf *Raft) serverLeader() {
 					return
 				}
 				if peerMsg.Success == false {
-					logs.Info("peerMsg deny %v", peerMsg)
+					log.Println("peerMsg deny %v", peerMsg)
 					rf.nextIndex[peerMsg.Id]--
 				} else {
 					//返回的消息index大于上次发送的index
@@ -553,7 +553,7 @@ func (rf *Raft) serverFollow() {
 				rf.requestVote(peerMsg.args, peerMsg.reply)
 				close(peerMsg.syncCh)
 			default:
-				logs.Info("unkownType %v", val)
+				logs.Println("unkownType %v", val)
 			}
 		}
 	}
@@ -599,7 +599,7 @@ func (rf *Raft) serverCandidate() {
 				rf.requestVote(peerMsg.args, peerMsg.reply)
 				close(peerMsg.syncCh)
 			default:
-				logs.Info("unkownType %v", val)
+				log.Println("unkownType %v", val)
 			}
 		}
 
@@ -627,7 +627,7 @@ func (rf *Raft) logUpTodate(args *RequestVoteArgs) bool {
 //成为leader时调用的函数
 //不应该同步不是该term内的数据？
 func (rf *Raft) initLeader() {
-	logs.Info("%v become Leader", rf.me)
+	log.Println("%v become Leader", rf.me)
 	for k, _ := range rf.peers {
 		rf.nextIndex[k] = len(rf.logs) + 1
 		rf.matchIndex[k] = 0
@@ -662,7 +662,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.votedFor = -1
 
-	logs.SetLevel(5)
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = make(map[int]int, len(peers))
 	rf.matchIndex = make(map[int]int, len(peers))
