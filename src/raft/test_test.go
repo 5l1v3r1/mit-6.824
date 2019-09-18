@@ -337,7 +337,6 @@ func TestRejoin2B(t *testing.T) {
 
 //这个地方测试偶尔会panic
 //panic猜测是由于并发的goroutine等到运行时取值才导致的
-//这个函数测试偶尔会不通过，猜测是提交了以前term的日志
 func TestBackup2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false)

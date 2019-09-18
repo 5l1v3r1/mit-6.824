@@ -231,7 +231,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 	if rf.status != Follower { //身份转变成follower
 		if args.Term > rf.currentTerm {
-			logs.Info(" %v term %v converto to follow", rf.me, args.Term)
+			// logs.Info(" %v term %v converto to follow", rf.me, args.Term)
 			rf.meetBigTerm(args.Term)
 			rf.statusCh <- true
 		}
@@ -273,7 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					Command:      rf.logs[i-1].Command,
 					CommandIndex: i,
 				}
-				logs.Info("follower apply %v", msg)
+				// logs.Info("follower apply %v", msg)
 				rf.applyCh <- msg
 			}
 			rf.commitIndex = curCommitIndex
@@ -477,11 +477,11 @@ func (rf *Raft) serverLeader() {
 		select {
 		case <-rf.statusCh:
 			if rf.status != Leader {
-				logs.Info("leader %v become follower", rf.me)
+				// logs.Info("leader %v become follower", rf.me)
 				return
 			}
 		case <-ticker.C:
-			logs.Info("%v send heartbeat term %v", rf.me, rf.currentTerm)
+			// logs.Info("%v send heartbeat term %v", rf.me, rf.currentTerm)
 			rf.sendAppendEntries()
 			ticker.Reset(GenTimeoutDuration(50, 50))
 		case val := <-rf.msgCh:
@@ -496,7 +496,7 @@ func (rf *Raft) serverLeader() {
 				close(peerMsg.syncCh)
 			case *AppendEntriesReply: //发送消息的回报，心跳也在这里处理
 				if peerMsg.Term > rf.currentTerm {
-					logs.Info("%v leader become follower bigTerm:%v", rf.me, peerMsg.Term)
+					// logs.Info("%v leader become follower bigTerm:%v", rf.me, peerMsg.Term)
 					rf.meetBigTerm(peerMsg.Term)
 					return
 				}
@@ -518,15 +518,15 @@ func (rf *Raft) serverLeader() {
 								Command:      rf.logs[i-1].Command,
 								CommandIndex: i,
 							}
-							logs.Warn("Leader send apply %v", msg)
+							// logs.Warn("Leader send apply %v", msg)
 							rf.applyCh <- msg
 						}
 					}(rf.commitIndex)
 					rf.commitIndex = curCommitIndex
-					logs.Info("leader %v  term %vcommit Index%v %v  %v len=%v ", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, rf.nextIndex, len(rf.logs))
+					// logs.Info("leader %v  term %vcommit Index%v %v  %v len=%v ", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, rf.nextIndex, len(rf.logs))
 				}
 			default:
-				logs.Info("unkownType %v", val)
+				// logs.Info("unkownType %v", val)
 			}
 		}
 	}
@@ -537,11 +537,11 @@ func (rf *Raft) serverFollow() {
 	for {
 		select {
 		case <-ticker.C: //超时了
-			logs.Info("%v timeout", rf.me)
+			// logs.Info("%v timeout", rf.me)
 			rf.status = Candidate
 			return
 		case <-rf.hearbeatNotify: //收到来自leader的消息
-			logs.Info("%v recv heartbeat from leader\n", rf.me)
+			// logs.Info("%v recv heartbeat from leader\n", rf.me)
 			ticker.Reset(GenTimeoutDuration(200, 200))
 		case val := <-rf.msgCh:
 			//收到来自peer的消息
@@ -566,19 +566,19 @@ func (rf *Raft) serverCandidate() {
 		select {
 		case <-rf.statusCh:
 			if rf.status != Candidate {
-				logs.Info(" %v status convert to %v ", rf.me, rf.status)
+				// logs.Info(" %v status convert to %v ", rf.me, rf.status)
 				return
 			}
 		case <-ticker.C:
 			//超时重新发起投票
-			logs.Info("%v timeout term %v", rf.me, rf.currentTerm)
+			// logs.Info("%v timeout term %v", rf.me, rf.currentTerm)
 			rf.handleTimeout()
 			ticker.Reset(GenTimeoutDuration(200, 200))
 		case val := <-rf.msgCh:
 			//收到来自peer的消息
 			switch peerMsg := val.(type) {
 			case *RequestVoteReply:
-				logs.Info("%v %v recv peer message %v ", rf.me, rf.currentTerm, *peerMsg)
+				// logs.Info("%v %v recv peer message %v ", rf.me, rf.currentTerm, *peerMsg)
 				if peerMsg.Term > rf.currentTerm {
 					rf.currentTerm = peerMsg.Term
 					rf.votedFor = -1
@@ -662,6 +662,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.votedFor = -1
 
+	logs.SetLevel(5)
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = make(map[int]int, len(peers))
 	rf.matchIndex = make(map[int]int, len(peers))
