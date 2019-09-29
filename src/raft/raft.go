@@ -246,7 +246,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.statusCh <- true
 	}
 	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		log.Println("deny request reason %v len %v", args, len(rf.logs))
+		log.Printf("deny request reason %v len %v\n", args, len(rf.logs))
 		reply.Success = false
 		return
 	}
@@ -501,7 +501,7 @@ func (rf *Raft) serverLeader() {
 					return
 				}
 				if peerMsg.Success == false {
-					log.Println("peerMsg deny %v", peerMsg)
+					log.Printf("peerMsg deny %v\n", peerMsg)
 					rf.nextIndex[peerMsg.Id]--
 				} else {
 					//返回的消息index大于上次发送的index
@@ -553,7 +553,7 @@ func (rf *Raft) serverFollow() {
 				rf.requestVote(peerMsg.args, peerMsg.reply)
 				close(peerMsg.syncCh)
 			default:
-				logs.Println("unkownType %v", val)
+				log.Printf("unkownType %v\n", val)
 			}
 		}
 	}
@@ -599,7 +599,7 @@ func (rf *Raft) serverCandidate() {
 				rf.requestVote(peerMsg.args, peerMsg.reply)
 				close(peerMsg.syncCh)
 			default:
-				log.Println("unkownType %v", val)
+				log.Printf("unkownType %v\n", val)
 			}
 		}
 
@@ -627,7 +627,7 @@ func (rf *Raft) logUpTodate(args *RequestVoteArgs) bool {
 //成为leader时调用的函数
 //不应该同步不是该term内的数据？
 func (rf *Raft) initLeader() {
-	log.Println("%v become Leader", rf.me)
+	log.Printf("%v become Leader\n", rf.me)
 	for k, _ := range rf.peers {
 		rf.nextIndex[k] = len(rf.logs) + 1
 		rf.matchIndex[k] = 0
