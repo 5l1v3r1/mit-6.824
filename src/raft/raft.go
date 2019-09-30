@@ -18,12 +18,17 @@ package raft
 //
 
 import (
+	// "bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
 	"sync"
 	"time"
 
+	// "6.824/src/labgob"
+
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
 )
 
@@ -65,13 +70,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm    int
-	votedFor       int
+	currentTerm    int //persistent
+	votedFor       int //persistent
 	commitIndex    int
 	lastApplied    int
 	nextIndex      map[int]int //index从1开始，初始值为len(logs）+1
 	matchIndex     map[int]int //初始值为0
-	logs           []LogEntry
+	logs           []LogEntry  //persistent
 	leader         int
 	hearbeatNotify chan bool
 	applyCh        chan ApplyMsg    //业务
@@ -79,6 +84,7 @@ type Raft struct {
 	voteMap        map[int]bool     //当前term，peer节点的投票情况
 	status         int
 	statusCh       chan bool //身份的转变
+	lock           sync.Mutex
 }
 
 type LogEntry struct {
@@ -105,7 +111,16 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+// 理论上来说，需要保存的变量在变化时，都需要调用这个函数持久化
 func (rf *Raft) persist() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -122,6 +137,20 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var persistLogs []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil ||
+		d.Decode(&persistLogs) != nil {
+		fmt.Println("readPersist error")
+
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = persistLogs
+		fmt.Printf(" %v readPresist  from %v %v %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.logs)
 	}
 	// Your code here (2C).
 	// Example:
@@ -219,6 +248,7 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			rf.voteMap = make(map[int]bool)
 			reply.VoteGranted = true
+			rf.persist()
 			//需不需要变成follower?
 		}
 	}
@@ -246,7 +276,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.statusCh <- true
 	}
 	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex != 0 && len(rf.logs) > 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		log.Printf("deny request reason %v len %v\n", args, len(rf.logs))
+		fmt.Printf("deny request reason %v len %v\n", args, len(rf.logs))
 		reply.Success = false
 		return
 	}
@@ -262,6 +292,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.logs = rf.logs[:index] //截断
 		rf.logs = append(rf.logs, args.Entries[appendIndex:]...)
+		rf.persist()
 	}
 	curCommitIndex := min(args.LeaderCommitIndex, len(rf.logs))
 	//这个判断条件防止 follower由于收到心跳 提前提交不在当前term内的日志
@@ -273,7 +304,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					Command:      rf.logs[i-1].Command,
 					CommandIndex: i,
 				}
-				// logs.Info("follower apply %v", msg)
+				fmt.Printf("follower apply %v\n", msg)
 				rf.applyCh <- msg
 			}
 			rf.commitIndex = curCommitIndex
@@ -364,6 +395,7 @@ func (rf *Raft) sendAppendEntries() bool {
 			//这里是否有必要在reply中加上matchIndex?
 			if ok {
 				if len(args.Entries) > 0 {
+					fmt.Printf("leader %v send logs %v to %v\n", rf.me, args.Entries, i)
 					reply.MatchIndex = args.PrevLogIndex + len(args.Entries)
 				}
 				reply.Id = i
@@ -388,6 +420,7 @@ func (rf *Raft) handleTimeout() {
 	//给自己投票
 	rf.votedFor = rf.me
 	rf.voteMap[rf.me] = true
+	rf.persist()
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -438,7 +471,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.currentTerm,
 	})
+	rf.lock.Lock()
 	rf.matchIndex[rf.me] = len(rf.logs)
+	rf.lock.Unlock()
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -501,16 +537,20 @@ func (rf *Raft) serverLeader() {
 					return
 				}
 				if peerMsg.Success == false {
-					log.Printf("peerMsg deny %v\n", peerMsg)
-					rf.nextIndex[peerMsg.Id]--
+					//这里是不是可以优化?每次步调减一
+					fmt.Printf("peerMsg deny %v\n", peerMsg)
+					// rf.nextIndex[peerMsg.Id]--
+					rf.nextIndex[peerMsg.Id] = rf.matchIndex[peerMsg.Id] + 1
 				} else {
 					//返回的消息index大于上次发送的index
+					rf.lock.Lock()
 					if peerMsg.MatchIndex > rf.matchIndex[peerMsg.Id] {
 						rf.nextIndex[peerMsg.Id] = peerMsg.MatchIndex + 1
 						rf.matchIndex[peerMsg.Id] = peerMsg.MatchIndex
 						//查询当前match
 					}
 					curCommitIndex := pollCommitIndex(rf.matchIndex)
+					rf.lock.Unlock()
 					go func(index int) {
 						for i := index + 1; i <= curCommitIndex; i++ {
 							msg := ApplyMsg{
@@ -580,10 +620,7 @@ func (rf *Raft) serverCandidate() {
 			case *RequestVoteReply:
 				// logs.Info("%v %v recv peer message %v ", rf.me, rf.currentTerm, *peerMsg)
 				if peerMsg.Term > rf.currentTerm {
-					rf.currentTerm = peerMsg.Term
-					rf.votedFor = -1
-					rf.voteMap = make(map[int]bool)
-					rf.status = Follower
+					rf.meetBigTerm(peerMsg.Term)
 					return
 				}
 				rf.voteMap[peerMsg.ReplyID] = peerMsg.VoteGranted
@@ -627,7 +664,7 @@ func (rf *Raft) logUpTodate(args *RequestVoteArgs) bool {
 //成为leader时调用的函数
 //不应该同步不是该term内的数据？
 func (rf *Raft) initLeader() {
-	log.Printf("%v become Leader\n", rf.me)
+	fmt.Printf("%v become Leader\n", rf.me)
 	for k, _ := range rf.peers {
 		rf.nextIndex[k] = len(rf.logs) + 1
 		rf.matchIndex[k] = 0
@@ -641,6 +678,7 @@ func (rf *Raft) meetBigTerm(bigTerm int) {
 	rf.votedFor = -1
 	rf.voteMap = make(map[int]bool)
 	rf.status = Follower
+	rf.persist()
 }
 
 //

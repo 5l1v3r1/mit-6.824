@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -705,6 +704,7 @@ func TestFigure82C(t *testing.T) {
 	cfg.end()
 }
 
+//这个测试用例会触发map的并发读写? 09-31 update:代码加锁fix
 func TestUnreliableAgree2C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, true)
